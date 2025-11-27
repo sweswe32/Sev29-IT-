@@ -1,6 +1,5 @@
 import os
 from datetime import datetime
-
 from dotenv import load_dotenv
 import telebot
 from telebot import types
@@ -8,35 +7,32 @@ from openpyxl import Workbook, load_workbook
 
 # ================= НАСТРОЙКИ =====================
 
-# Загружаем .env и токен
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-print("Loaded TELEGRAM_BOT_TOKEN:", TOKEN)
-
 if not TOKEN:
-    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в файле .env")
+    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в .env")
 
 bot = telebot.TeleBot(TOKEN)
 
-# Имя Excel-файла очереди заказов
 EXCEL_FILE = "orders.xlsx"
-MAX_ITEMS_PER_ORDER = 10  # сколько позиций товара максимум пишем в строку
+MAX_ITEMS_PER_ORDER = 10
 
-# Каталог товаров (пример — под себя можешь поменять)
-# ВАЖНО: пути к картинкам существуют в папке images/
+
+# ================= СПИСОК ТОВАРОВ =====================
+
 PRODUCTS = [
     {
         "id": 1,
         "name": "Фигурка дракона",
         "price": 500,
         "model": "dragon.stl",
-        "description": "Дракон 10 см, PLA-пластик.",
+        "description": "Дракон 10 см, PLA пластик.",
         "image": "images/dragon.jpg",
     },
     {
         "id": 2,
-        "name": "Держатель для телефона",
+        "name": "Держатель телефона",
         "price": 300,
         "model": "phone_holder.stl",
         "description": "Универсальный держатель для смартфона.",
@@ -47,26 +43,24 @@ PRODUCTS = [
         "name": "Ключница настенная",
         "price": 450,
         "model": "key_holder.stl",
-        "description": "Настенная ключница на 5 крючков.",
+        "description": "Ключница на 5 крючков.",
         "image": "images/key_holder.jpg",
     },
 ]
 
-# ================= СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ =================
 
-user_carts = {}       # user_id -> [ {name, qty, price, model}, ... ]
-user_states = {}      # user_id -> state (None, waiting_qty, waiting_fio, waiting_phone)
-pending_product = {}  # user_id -> product_id
-checkout_data = {}    # user_id -> {"fio": ..., "phone": ...}
+# ================= ХРАНЕНИЕ СОСТОЯНИЙ =====================
 
-# Очередь заказов для оператора
-orders_queue = []     # список словарей с заказами
+user_carts = {}      # user_id -> список товаров
+user_states = {}     # user_id -> state
+pending_product = {} # user_id -> product_id
+checkout_data = {}   # user_id -> { fio, phone }
+orders_queue = []    # очередь заказов
 
 
-# ================= РАБОТА С EXCEL =========================
+# ================ EXCEL ==========================
 
 def init_workbook():
-    """Создаем Excel с заголовками, если его еще нет."""
     if os.path.exists(EXCEL_FILE):
         return
 
@@ -76,12 +70,13 @@ def init_workbook():
 
     headers = ["Дата заказа", "ФИО", "Телефон"]
 
-    # Далее блоки по 3 столбца для каждой позиции заказа
     for i in range(1, MAX_ITEMS_PER_ORDER + 1):
         headers.extend([
             f"Имя товара {i}",
-            f"Кол-во товара {i} (шт)",
-            f"Модель {i} (имя_товара.stl)",
+            f"Кол-во {i}",
+            f"Цена за шт. {i}",
+            f"Сумма {i}",
+            f"Модель {i}"
         ])
 
     ws.append(headers)
@@ -89,10 +84,6 @@ def init_workbook():
 
 
 def save_order_to_excel(fio: str, phone: str, items: list):
-    """
-    Сохранение заказа в Excel-файл.
-    items: список dict с ключами name, qty, model
-    """
     init_workbook()
     wb = load_workbook(EXCEL_FILE)
     ws = wb.active
@@ -100,32 +91,41 @@ def save_order_to_excel(fio: str, phone: str, items: list):
     date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
     row = [date_str, fio, phone]
 
-    # Гарантируем фиксированное количество колонок на строку
     for i in range(MAX_ITEMS_PER_ORDER):
         if i < len(items):
             item = items[i]
-            row.extend([item["name"], item["qty"], item["model"]])
+            qty = item["qty"]
+            price = item["price"]
+            total = qty * price
+
+            row.extend([
+                item["name"],
+                qty,
+                price,
+                total,
+                item["model"],
+            ])
         else:
-            row.extend(["", "", ""])
+            row.extend(["", "", "", "", ""])
 
     ws.append(row)
     wb.save(EXCEL_FILE)
 
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+# ================= ВСПОМОГАТЕЛЬНОЕ =====================
 
-def get_product_by_id(prod_id: int):
+def get_product_by_id(pid):
     for p in PRODUCTS:
-        if p["id"] == prod_id:
+        if p["id"] == pid:
             return p
     return None
 
 
-def get_cart(user_id: int):
+def get_cart(user_id):
     return user_carts.get(user_id, [])
 
 
-def add_to_cart(user_id: int, product: dict, qty: int):
+def add_to_cart(user_id, product, qty):
     cart = user_carts.setdefault(user_id, [])
     cart.append({
         "name": product["name"],
@@ -135,45 +135,40 @@ def add_to_cart(user_id: int, product: dict, qty: int):
     })
 
 
-def format_cart_text(user_id: int) -> str:
+def format_cart_text(user_id):
     cart = get_cart(user_id)
     if not cart:
-        return "🛒 Ваша корзина пуста."
+        return "Корзина пуста."
 
     total = 0
     lines = []
-    for i, item in enumerate(cart, start=1):
-        line_sum = item["price"] * item["qty"]
-        total += line_sum
-        lines.append(
-            f"{i}. {item['name']} — {item['qty']} шт × {item['price']} ₽ = {line_sum} ₽"
-        )
+    for i, item in enumerate(cart, 1):
+        s = item["qty"] * item["price"]
+        total += s
+        lines.append(f"{i}. {item['name']} — {item['qty']} шт × {item['price']} ₽ = {s} ₽")
 
-    lines.append(f"\nИтого: {total} ₽")
+    lines.append(f"\nИТОГО: {total} ₽")
     return "\n".join(lines)
 
 
 def main_menu_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton("Каталог товаров"),
-           types.KeyboardButton("Корзина"))
+    kb.add("Каталог товаров", "Корзина")
     return kb
 
 
 def cart_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton("Оформить заказ"),
-           types.KeyboardButton("Очистить корзину"))
-    kb.add(types.KeyboardButton("Каталог товаров"))
+    kb.add("Оформить заказ", "Очистить корзину")
+    kb.add("Каталог товаров")
     return kb
 
 
-def send_catalog_cards(chat_id: int):
-    """Показать карточки товаров: фото + описание + кнопка."""
+def send_catalog(chat_id):
     for p in PRODUCTS:
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton(
-            text=f"Добавить в корзину",
+            text="Добавить в корзину",
             callback_data=f"add_{p['id']}"
         ))
 
@@ -184,237 +179,153 @@ def send_catalog_cards(chat_id: int):
             f"Модель: <code>{p['model']}</code>"
         )
 
-        image_path = p.get("image")
-        if image_path and os.path.exists(image_path):
-            with open(image_path, "rb") as img:
-                bot.send_photo(
-                    chat_id,
-                    img,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=kb
-                )
+        if os.path.exists(p["image"]):
+            with open(p["image"], "rb") as img:
+                bot.send_photo(chat_id, img, caption=caption, parse_mode="HTML", reply_markup=kb)
         else:
-            # Если картинка не найдена — просто текст
-            bot.send_message(
-                chat_id,
-                caption,
-                parse_mode="HTML",
-                reply_markup=kb
-            )
+            bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
 
 
-# ================== ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ ==================
+# ================== ХЕНДЛЕРЫ ==========================
 
 @bot.message_handler(commands=["start"])
-def handle_start(message: types.Message):
-    user_id = message.from_user.id
-    user_states[user_id] = None
-    user_carts[user_id] = []
-
-    bot.send_message(
-        message.chat.id,
-        "Привет! 👋\n"
-        "Я бот для оформления заказов на 3D-печать.\n\n"
-        "Я умею:\n"
-        "• показывать каталог товаров (карточки с фото);\n"
-        "• добавлять товары в корзину;\n"
-        "• оформлять заказ (ФИО + телефон);\n"
-        "• записывать заказ в Excel и в очередь.\n\n"
-        "Нажми «Каталог товаров», чтобы посмотреть продукцию.",
-        reply_markup=main_menu_keyboard(),
-    )
+def start(message):
+    user_carts[message.from_user.id] = []
+    user_states[message.from_user.id] = None
+    bot.send_message(message.chat.id,
+                     "Добро пожаловать! Это бот для заказов 3D-печати.",
+                     reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text == "Каталог товаров")
-def handle_catalog(message: types.Message):
-    send_catalog_cards(message.chat.id)
+def catalog(message):
+    send_catalog(message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("add_"))
-def handle_add_product(call: types.CallbackQuery):
+def add_handler(call):
     user_id = call.from_user.id
-    prod_id = int(call.data.split("_")[1])
-    product = get_product_by_id(prod_id)
+    product_id = int(call.data.split("_")[1])
 
-    if not product:
-        bot.answer_callback_query(call.id, "Товар не найден.")
-        return
-
-    pending_product[user_id] = prod_id
+    pending_product[user_id] = product_id
     user_states[user_id] = "waiting_qty"
 
+    bot.send_message(call.message.chat.id,
+                     "Введите количество товара:")
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        f"Сколько штук товара «{product['name']}» добавить в корзину? Введите число."
-    )
 
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_qty")
-def handle_quantity(message: types.Message):
+def qty_handler(message):
     user_id = message.from_user.id
-    text = message.text.strip()
 
-    if not text.isdigit() or int(text) <= 0:
-        bot.send_message(
-            message.chat.id,
-            "Пожалуйста, введите целое положительное число.",
-        )
+    if not message.text.isdigit() or int(message.text) <= 0:
+        bot.send_message(message.chat.id, "Введите корректное число.")
         return
 
-    qty = int(text)
-    prod_id = pending_product.get(user_id)
-    product = get_product_by_id(prod_id)
-
-    if not product:
-        bot.send_message(
-            message.chat.id,
-            "Ошибка: товар не найден. Попробуйте снова через каталог.",
-            reply_markup=main_menu_keyboard(),
-        )
-        user_states[user_id] = None
-        pending_product.pop(user_id, None)
-        return
+    qty = int(message.text)
+    product = get_product_by_id(pending_product[user_id])
 
     add_to_cart(user_id, product, qty)
-    user_states[user_id] = None
-    pending_product.pop(user_id, None)
 
-    bot.send_message(
-        message.chat.id,
-        f"✅ Добавлено в корзину: {product['name']} — {qty} шт.\n\n"
-        f"{format_cart_text(user_id)}",
-        reply_markup=cart_keyboard(),
-    )
+    user_states[user_id] = None
+    pending_product.pop(user_id)
+
+    bot.send_message(message.chat.id,
+                     f"Добавлено в корзину: {product['name']} — {qty} шт.",
+                     reply_markup=cart_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text == "Корзина")
-def handle_cart(message: types.Message):
-    user_id = message.from_user.id
-    text = format_cart_text(user_id)
-    reply_kb = cart_keyboard() if get_cart(user_id) else main_menu_keyboard()
-    bot.send_message(message.chat.id, text, reply_markup=reply_kb)
+def show_cart(message):
+    bot.send_message(message.chat.id,
+                     format_cart_text(message.from_user.id),
+                     reply_markup=cart_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text == "Очистить корзину")
-def handle_clear_cart(message: types.Message):
-    user_id = message.from_user.id
-    user_carts[user_id] = []
-    bot.send_message(
-        message.chat.id,
-        "Корзина очищена.",
-        reply_markup=main_menu_keyboard(),
-    )
+def clear_cart(message):
+    user_carts[message.from_user.id] = []
+    bot.send_message(message.chat.id,
+                     "Корзина очищена.",
+                     reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text == "Оформить заказ")
-def handle_checkout_start(message: types.Message):
-    user_id = message.from_user.id
-    cart = get_cart(user_id)
-
-    if not cart:
-        bot.send_message(
-            message.chat.id,
-            "Ваша корзина пуста. Сначала добавьте товары из каталога.",
-            reply_markup=main_menu_keyboard(),
-        )
+def checkout_start(message):
+    if not get_cart(message.from_user.id):
+        bot.send_message(message.chat.id, "Корзина пуста.")
         return
 
-    user_states[user_id] = "waiting_fio"
-    checkout_data[user_id] = {}
-    bot.send_message(
-        message.chat.id,
-        "Для оформления заказа введите, пожалуйста, ваше ФИО полностью:"
-    )
+    user_states[message.from_user.id] = "waiting_fio"
+    bot.send_message(message.chat.id, "Введите ваше ФИО:")
 
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_fio")
-def handle_checkout_fio(message: types.Message):
-    user_id = message.from_user.id
+def fio(message):
     fio = message.text.strip()
-
     if len(fio.split()) < 2:
-        bot.send_message(
-            message.chat.id,
-            "Пожалуйста, введите фамилию и имя (можно с отчеством).",
-        )
+        bot.send_message(message.chat.id, "Введите ФИО полностью.")
         return
 
-    checkout_data[user_id]["fio"] = fio
-    user_states[user_id] = "waiting_phone"
-    bot.send_message(
-        message.chat.id,
-        "Введите, пожалуйста, ваш номер телефона:"
-    )
+    uid = message.from_user.id
+    checkout_data[uid] = {"fio": fio}
+    user_states[uid] = "waiting_phone"
+
+    bot.send_message(message.chat.id, "Введите номер телефона:")
 
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_phone")
-def handle_checkout_phone(message: types.Message):
-    user_id = message.from_user.id
+def phone(message):
     phone = message.text.strip()
+    uid = message.from_user.id
 
-    if len(phone) < 6:
-        bot.send_message(
-            message.chat.id,
-            "Номер телефона выглядит слишком коротким. Попробуйте еще раз:",
-        )
-        return
+    checkout_data[uid]["phone"] = phone
+    fio = checkout_data[uid]["fio"]
+    cart = get_cart(uid)
 
-    fio = checkout_data[user_id]["fio"]
-    checkout_data[user_id]["phone"] = phone
-    cart = get_cart(user_id)
+    # Excel
+    save_order_to_excel(fio, phone, cart)
 
-    # 1) сохраняем в Excel
-    save_order_to_excel(fio=fio, phone=phone, items=cart)
-
-    # 2) добавляем в очередь заказов
-    order_entry = {
+    # очередь
+    orders_queue.append({
         "timestamp": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "fio": fio,
         "phone": phone,
-        "items": cart.copy(),
-    }
-    orders_queue.append(order_entry)
+        "items": cart.copy()
+    })
 
-    # 3) очищаем данные пользователя
-    user_states[user_id] = None
-    user_carts[user_id] = []
-    checkout_data.pop(user_id, None)
+    # очистка
+    user_carts[uid] = []
+    user_states[uid] = None
+    checkout_data.pop(uid)
 
-    bot.send_message(
-        message.chat.id,
-        "🎉 Спасибо! Ваш заказ оформлен.\n"
-        "Он добавлен в очередь и записан в Excel.",
-        reply_markup=main_menu_keyboard(),
-    )
+    bot.send_message(message.chat.id,
+                     "Заказ оформлен! Он добавлен в очередь.",
+                     reply_markup=main_menu_keyboard())
 
 
-# ================== ОЧЕРЕДЬ ЗАКАЗОВ (для оператора) ==================
+# ================ ОЧЕРЕДЬ ==================
 
 @bot.message_handler(commands=["queue"])
-def handle_queue(message: types.Message):
+def queue_view(message):
     if not orders_queue:
-        bot.send_message(message.chat.id, "Очередь заказов пуста.")
+        bot.send_message(message.chat.id, "Очередь пуста.")
         return
 
-    text = "📦 <b>Очередь заказов:</b>\n\n"
-    for i, o in enumerate(orders_queue, start=1):
-        text += (
-            f"{i}. <b>{o['fio']}</b> ({o['phone']}) — {o['timestamp']}\n"
-            f"Товаров: {len(o['items'])}\n\n"
-        )
+    text = "📦 Очередь заказов:\n\n"
+    for i, o in enumerate(orders_queue, 1):
+        text += f"{i}. {o['fio']} — {o['phone']} — {o['timestamp']}\n"
 
-    text += "Чтобы отметить заказ выполненным, используй команду: /done НОМЕР\nНапример: /done 1"
-    bot.send_message(message.chat.id, text, parse_mode="HTML")
+    text += "\nИспользуйте /done N для завершения"
+    bot.send_message(message.chat.id, text)
 
 
 @bot.message_handler(commands=["done"])
-def handle_done(message: types.Message):
+def done(message):
     parts = message.text.split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /done 2 (где 2 — номер заказа в очереди)")
+        bot.send_message(message.chat.id, "Формат: /done 1")
         return
 
     idx = int(parts[1]) - 1
@@ -423,45 +334,25 @@ def handle_done(message: types.Message):
         bot.send_message(message.chat.id, "Неверный номер заказа.")
         return
 
-    removed = orders_queue.pop(idx)
-    bot.send_message(
-        message.chat.id,
-        f"✅ Заказ {removed['fio']} ({removed['phone']}) помечен как выполненный и удалён из очереди."
-    )
+    order = orders_queue.pop(idx)
+    bot.send_message(message.chat.id,
+                     f"Заказ {order['fio']} завершён.")
 
 
 @bot.message_handler(commands=["clearqueue"])
-def handle_clear_queue(message: types.Message):
+def clear_q(message):
     orders_queue.clear()
-    bot.send_message(message.chat.id, "Очередь заказов полностью очищена.")
+    bot.send_message(message.chat.id, "Очередь очищена.")
 
 
-@bot.message_handler(commands=["help"])
-def handle_help(message: types.Message):
-    bot.send_message(
-        message.chat.id,
-        "Доступные команды:\n"
-        "/start — начать работу\n"
-        "/help — помощь\n"
-        "/queue — показать очередь заказов (для оператора)\n"
-        "/done N — отметить заказ №N выполненным\n"
-        "/clearqueue — очистить очередь заказов\n\n"
-        "Основные действия доступны через кнопки: «Каталог товаров», «Корзина».",
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-# Фолбек на непонятные сообщения
+# фолбек
 @bot.message_handler(func=lambda m: True)
-def handle_fallback(message: types.Message):
-    bot.send_message(
-        message.chat.id,
-        "Я не понял сообщение.\n"
-        "Используйте кнопки «Каталог товаров» или «Корзина», либо команду /help.",
-        reply_markup=main_menu_keyboard(),
-    )
+def fallback(message):
+    bot.send_message(message.chat.id,
+                     "Используйте кнопки или команды.",
+                     reply_markup=main_menu_keyboard())
 
 
-if __name__ == "__main__":
-    print("Бот запущен...")
-    bot.infinity_polling()
+# запуск
+print("Бот запущен...")
+bot.infinity_polling()
